@@ -13,13 +13,15 @@ export type Timeline = Message.Timeline
 
 export interface PlayerConfig {
 	connection: Connection
-	namespace: string
-	catalog: Catalog // TODO optional; fetch if not provided
+	canvas: HTMLCanvasElement
 }
 
 // This class must be created on the main thread due to AudioContext.
 export class Player {
 	#port: Port
+
+	// The video canvas
+	#canvas: OffscreenCanvas
 
 	// The audio context, which must be created on the main thread.
 	#context?: Context
@@ -27,17 +29,18 @@ export class Player {
 	// A periodically updated timeline
 	#timeline = new Watch<Timeline | undefined>(undefined)
 
+	#catalog: Promise<Catalog>
 	#running: Promise<void>
 
 	readonly connection: Connection
-	readonly namespace: string
-	readonly catalog: Catalog
 
 	constructor(config: PlayerConfig) {
 		this.#port = new Port(this.#onMessage.bind(this)) // TODO await an async method instead
+
+		this.#canvas = config.canvas.transferControlToOffscreen()
 		this.connection = config.connection
-		this.namespace = config.namespace
-		this.catalog = config.catalog
+
+		this.#catalog = Catalog.fetch(this.connection)
 
 		// Async work
 		this.#running = this.#run()
@@ -47,83 +50,27 @@ export class Player {
 		const inits = new Set<string>()
 		const tracks = new Array<Mp4Track>()
 
-		for (const track of this.catalog.tracks) {
+		const catalog = await this.#catalog
+
+		let sampleRate: number | undefined
+		let channels: number | undefined
+
+		for (const track of catalog.tracks) {
 			if (!isMp4Track(track)) {
 				throw new Error(`expected CMAF track`)
 			}
 
 			inits.add(track.init_track)
 			tracks.push(track)
-		}
 
-		// Call #runInit on each unique init track
-		// TODO do this in parallel with #runTrack to remove a round trip
-		await Promise.all(Array.from(inits).map((init) => this.#runInit(init)))
-
-		// Call #runTrack on each track
-		await Promise.all(tracks.map((track) => this.#runTrack(track)))
-	}
-
-	async #runInit(name: string) {
-		const sub = await this.connection.subscribe(this.namespace, name)
-		try {
-			const init = await sub.data()
-			if (!init) throw new Error("no init data")
-
-			if (init.header.sequence !== 0n) {
-				throw new Error("TODO multiple objects per init not supported")
-			}
-
-			this.#port.sendInit({
-				name: name,
-				stream: init.stream,
-			})
-		} finally {
-			await sub.close()
-		}
-	}
-
-	async #runTrack(track: Mp4Track) {
-		if (track.kind !== "audio" && track.kind !== "video") {
-			throw new Error(`unknown track kind: ${track.kind}`)
-		}
-
-		const sub = await this.connection.subscribe(this.namespace, track.data_track)
-		try {
-			for (;;) {
-				const segment = await sub.data()
-				if (!segment) break
-
-				if (segment.header.sequence !== 0n) {
-					throw new Error("TODO multiple objects per segment not supported")
+			if (isAudioTrack(track)) {
+				if (sampleRate && track.sample_rate !== sampleRate) {
+					throw new Error(`TODO multiple audio tracks with different sample rates`)
 				}
 
-				this.#port.sendSegment({
-					init: track.init_track,
-					kind: track.kind,
-					header: segment.header,
-					stream: segment.stream,
-				})
+				sampleRate = track.sample_rate
+				channels = Math.max(track.channel_count, channels ?? 0)
 			}
-		} finally {
-			await sub.close()
-		}
-	}
-
-	// Attach to the given canvas element
-	attach(canvas: HTMLCanvasElement) {
-		let sampleRate: number | undefined
-		let channels: number | undefined
-
-		for (const track of this.catalog.tracks) {
-			if (!isAudioTrack(track)) continue
-
-			if (sampleRate && track.sample_rate !== sampleRate) {
-				throw new Error(`TODO multiple audio tracks with different sample rates`)
-			}
-
-			sampleRate = track.sample_rate
-			channels = Math.max(track.channel_count, channels ?? 0)
 		}
 
 		const config: Message.Config = {}
@@ -141,10 +88,55 @@ export class Player {
 
 		// TODO only send the canvas if we have a video track
 		config.video = {
-			canvas: canvas.transferControlToOffscreen(),
+			canvas: this.#canvas,
 		}
 
 		this.#port.sendConfig(config) // send to the worker
+
+		// Call #runInit on each unique init track
+		// TODO do this in parallel with #runTrack to remove a round trip
+		await Promise.all(Array.from(inits).map((init) => this.#runInit(init)))
+
+		// Call #runTrack on each track
+		await Promise.all(tracks.map((track) => this.#runTrack(track)))
+	}
+
+	async #runInit(name: string) {
+		const sub = await this.connection.subscribe("", name)
+		try {
+			const init = await sub.data()
+			if (!init) throw new Error("no init data")
+
+			this.#port.sendInit({
+				name: name,
+				stream: init.stream,
+			})
+		} finally {
+			await sub.close()
+		}
+	}
+
+	async #runTrack(track: Mp4Track) {
+		if (track.kind !== "audio" && track.kind !== "video") {
+			throw new Error(`unknown track kind: ${track.kind}`)
+		}
+
+		const sub = await this.connection.subscribe("", track.data_track)
+		try {
+			for (;;) {
+				const segment = await sub.data()
+				if (!segment) break
+
+				this.#port.sendSegment({
+					init: track.init_track,
+					kind: track.kind,
+					header: segment.header,
+					stream: segment.stream,
+				})
+			}
+		} finally {
+			await sub.close()
+		}
 	}
 
 	#onMessage(msg: Message.FromWorker) {
@@ -164,6 +156,10 @@ export class Player {
 		} catch (e) {
 			return asError(e)
 		}
+	}
+
+	async catalog(): Promise<Catalog> {
+		return this.#catalog
 	}
 
 	/*
